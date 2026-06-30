@@ -5,7 +5,6 @@ import pandas as pd
 import numpy as np
 import joblib
 import io
-from typing import Optional
 
 app = FastAPI(title="Credit Risk API")
 
@@ -17,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load models
 xgb_model = joblib.load("xgb_model.pkl")
 iso_model = joblib.load("iso_model.pkl")
 feature_cols = joblib.load("feature_cols.pkl")
@@ -29,7 +27,7 @@ ANOMALY_FEATURES = [
 ]
 
 COLUMN_MAP = {
-    'SeriousDlqin2yrs': 'default',
+    'SeriousDlqin2yrs': 'default_val',
     'RevolvingUtilizationOfUnsecuredLines': 'revolving_utilization',
     'NumberOfTime30-59DaysPastDueNotWorse': 'past_due_30_59',
     'DebtRatio': 'debt_ratio',
@@ -41,16 +39,13 @@ COLUMN_MAP = {
     'NumberOfDependents': 'dependents',
 }
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+def engineer_features(df):
     df = df.copy()
-    # Rename columns if original Kaggle format
     df.rename(columns=COLUMN_MAP, inplace=True)
-    # Fill missing
     if 'monthly_income' in df.columns:
         df['monthly_income'].fillna(df['monthly_income'].median(), inplace=True)
     if 'dependents' in df.columns:
         df['dependents'].fillna(0, inplace=True)
-    # Engineer features
     df['monthly_debt'] = df.get('debt_ratio', 0) * df.get('monthly_income', 0)
     df['dti_ratio'] = np.where(df.get('monthly_income', 1) > 0,
                                df['monthly_debt'] / df.get('monthly_income', 1), 0)
@@ -64,25 +59,18 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df['young_borrower'] = (df.get('age', 30) < 25).astype(int)
     return df
 
-def get_risk_tier(prob: float) -> str:
-    if prob < 0.05:
-        return "Low Risk"
-    elif prob < 0.15:
-        return "Medium Risk"
-    else:
-        return "High Risk"
+def get_risk_tier(prob):
+    if prob < 0.05: return "Low Risk"
+    elif prob < 0.15: return "Medium Risk"
+    return "High Risk"
 
-def get_decision(risk_tier: str, fraud_flag: int) -> str:
-    if fraud_flag == 1:
-        return "Review"
-    elif risk_tier == "High Risk":
-        return "Reject"
-    elif risk_tier == "Medium Risk":
-        return "Approve with Conditions"
-    else:
-        return "Approve"
+def get_decision(risk_tier, fraud_flag):
+    if fraud_flag: return "Review"
+    if risk_tier == "High Risk": return "Reject"
+    if risk_tier == "Medium Risk": return "Approve with Conditions"
+    return "Approve"
 
-def get_fraud_signals(row) -> list:
+def get_fraud_signals(row):
     signals = []
     if row.get('monthly_income', 0) > 15000 and row.get('revolving_utilization', 0) > 0.7:
         signals.append("High income + high utilization")
@@ -90,13 +78,12 @@ def get_fraud_signals(row) -> list:
         signals.append("Identity theft signal")
     if row.get('real_estate_loans', 0) > 3 and row.get('total_delinquencies', 0) > 2:
         signals.append("Loan stacking")
-    if row.get('monthly_income', 1) % 1000 == 0:
-        signals.append("Round income")
+    if row.get('monthly_income', 1) % 1000 == 0 and row.get('monthly_income', 0) > 0:
+        signals.append("Round income flag")
     return signals
 
-def process_dataframe(df: pd.DataFrame):
+def process_dataframe(df):
     df = engineer_features(df)
-    # Ensure all feature cols exist
     for col in feature_cols:
         if col not in df.columns:
             df[col] = 0
@@ -126,14 +113,18 @@ async def analyze_csv(file: UploadFile = File(...)):
     if len(df) > 5000:
         df = df.head(5000)
     probs, fraud_flags, risk_tiers, decisions, processed = process_dataframe(df)
-
-    # Summary stats
-    tier_counts = pd.Series(risk_tiers).value_counts().to_dict()
-    decision_counts = pd.Series(decisions).value_counts().to_dict()
-
-    # Per-borrower table (first 100)
+    tier_counts = {}
+    for t in risk_tiers:
+        tier_counts[t] = tier_counts.get(t, 0) + 1
+    decision_counts = {}
+    for d in decisions:
+        decision_counts[d] = decision_counts.get(d, 0) + 1
+    buckets = [0] * 10
+    for p in probs:
+        idx = min(int(p * 10), 9)
+        buckets[idx] += 1
     rows = []
-    for i in range(min(100, len(df))):
+    for i in range(min(200, len(df))):
         rows.append({
             "id": i + 1,
             "default_probability": round(float(probs[i]) * 100, 1),
@@ -144,13 +135,6 @@ async def analyze_csv(file: UploadFile = File(...)):
             "monthly_income": round(float(processed['monthly_income'].iloc[i]), 0) if 'monthly_income' in processed.columns else None,
             "revolving_utilization": round(float(processed['revolving_utilization'].iloc[i]) * 100, 1) if 'revolving_utilization' in processed.columns else None,
         })
-
-    # Distribution buckets for histogram
-    buckets = [0] * 10
-    for p in probs:
-        idx = min(int(p * 10), 9)
-        buckets[idx] += 1
-
     return {
         "total_borrowers": len(df),
         "tier_counts": tier_counts,
